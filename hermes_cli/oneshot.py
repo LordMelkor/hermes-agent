@@ -171,6 +171,7 @@ def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    reasoning: object = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
 ) -> int:
@@ -182,6 +183,7 @@ def run_oneshot(
             env var, then config.yaml's model.default / model.model.
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
+        reasoning: Optional per-run reasoning effort override.
         toolsets: Optional comma-separated string or iterable of toolsets.
         usage_file: Optional path; when set, a JSON usage report (estimated
             cost, token counts, model, api_calls) is written there after the
@@ -246,6 +248,7 @@ def run_oneshot(
                     prompt,
                     model=model,
                     provider=provider,
+                    reasoning=reasoning,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                 )
@@ -323,6 +326,7 @@ def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    reasoning: object = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
 ) -> tuple[str, dict]:
@@ -430,6 +434,19 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+        reasoning_config = resolve_reasoning_config(cfg, effective_model or "")
+        if reasoning is not None and str(reasoning).strip():
+            explicit_reasoning = parse_reasoning_effort(reasoning)
+            if explicit_reasoning is None:
+                logging.warning(
+                    "Unknown --reasoning '%s', keeping the configured level",
+                    reasoning,
+                )
+            else:
+                reasoning_config = explicit_reasoning
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -442,6 +459,7 @@ def _run_agent(
             platform="cli",
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
+            reasoning_config=reasoning_config,
             fallback_model=_fb or None,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:

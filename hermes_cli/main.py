@@ -178,6 +178,7 @@ def _run_and_exit_oneshot(
     *,
     model: object = None,
     provider: object = None,
+    reasoning: object = None,
     toolsets: object = None,
     usage_file: object = None,
 ) -> None:
@@ -188,6 +189,7 @@ def _run_and_exit_oneshot(
             prompt,
             model=model,
             provider=provider,
+            reasoning=reasoning,
             toolsets=toolsets,
             usage_file=usage_file,
         )
@@ -11010,6 +11012,7 @@ def _try_fast_chat_launch() -> bool:
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            reasoning=getattr(args, "reasoning", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
@@ -11066,6 +11069,7 @@ def _try_termux_fast_cli_launch() -> bool:
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            reasoning=getattr(args, "reasoning", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
@@ -12760,6 +12764,7 @@ def main():
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            reasoning=getattr(args, "reasoning", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
