@@ -26,7 +26,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, List, NamedTuple, Optional
+from typing import Any, Callable, List, NamedTuple, Optional
 
 from hermes_cli.providers import (
     ProviderDef,
@@ -283,14 +283,49 @@ class _NativePickerModelList(list[str]):
     """A successful native catalog, including an authoritative empty one."""
 
 
-def _fetch_picker_live_models(
+_MODEL_DISCOVERY_TOKEN_PROVIDERS: dict[
+    tuple[str, str], Callable[[], str]
+] = {}
+
+
+def _with_key_cmd_discovery_credential(
     api_key: str,
+    entry: dict,
+    label: str,
+) -> tuple[str | Callable[[], str], str | None]:
+    """Return a reusable command-backed credential for model discovery."""
+    key_cmd = str(entry.get("key_cmd", "") or "").strip()
+    if not key_cmd:
+        return api_key, None
+    try:
+        from agent.command_token_source import build_command_token_provider
+
+        token_key = (label, key_cmd)
+        token_provider = _MODEL_DISCOVERY_TOKEN_PROVIDERS.get(token_key)
+        if token_provider is None:
+            token_provider = build_command_token_provider(key_cmd, label)
+            if token_provider is not None:
+                _MODEL_DISCOVERY_TOKEN_PROVIDERS[token_key] = token_provider
+        if token_provider is not None:
+            return token_provider, f"key_cmd:{key_cmd}"
+    except Exception:
+        logger.debug(
+            "Could not create model-discovery token source for %s",
+            label,
+            exc_info=True,
+        )
+    return api_key, None
+
+
+def _fetch_picker_live_models(
+    api_key: str | Callable[[], str],
     api_url: str,
     native_catalog_provider: str,
     preserve_native_models: bool,
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
     api_mode: str | None = None,
+    cache_credential_id: str | None = None,
 ) -> list[str] | None:
     """Fetch picker models with native Ollama and cached generic discovery."""
     from hermes_cli.models import (
@@ -301,7 +336,8 @@ def _fetch_picker_live_models(
         should_use_ollama_native_catalog,
     )
 
-    candidate_headers = _get_ollama_native_headers(api_url, api_key=api_key)
+    static_api_key = api_key if isinstance(api_key, str) else ""
+    candidate_headers = _get_ollama_native_headers(api_url, api_key=static_api_key)
     caller_has_authorization = any(
         key.lower() == "authorization" for key in (headers or {})
     )
@@ -314,11 +350,11 @@ def _fetch_picker_live_models(
             if any(key.lower() == existing.lower() for existing in headers):
                 del candidate_headers[key]
         candidate_headers.update(headers)
-    if api_key and not caller_has_authorization:
+    if static_api_key and not caller_has_authorization:
         for key in tuple(candidate_headers):
             if key.lower() == "authorization":
                 del candidate_headers[key]
-        candidate_headers["Authorization"] = f"Bearer {api_key}"
+        candidate_headers["Authorization"] = f"Bearer {static_api_key}"
     use_native = should_use_ollama_native_catalog(
         native_catalog_provider, api_url, headers=candidate_headers or None
     )
@@ -340,6 +376,7 @@ def _fetch_picker_live_models(
             timeout=timeout,
             headers=resolved_headers,
             api_mode=api_mode,
+            cache_credential_id=cache_credential_id,
         )
     generic_models = cached_fetch_api_models(
         api_key,
@@ -347,6 +384,7 @@ def _fetch_picker_live_models(
         timeout=timeout,
         headers=resolved_headers,
         api_mode=api_mode,
+        cache_credential_id=cache_credential_id,
     )
     return generic_models if generic_models else None
 
@@ -3245,15 +3283,20 @@ def list_authenticated_providers(
                 ep_cfg.get("key_env") or ep_cfg.get("api_key_env") or ""
             ).strip()
             inline_api_key = str(ep_cfg.get("api_key", "") or "").strip()
+            key_cmd = str(ep_cfg.get("key_cmd", "") or "").strip()
             api_mode = str(
                 ep_cfg.get("api_mode")
                 or ep_cfg.get("transport")
                 or ""
             ).strip().lower() or None
             credential_identity = (
-                inline_api_key
-                if inline_api_key
-                else (f"env:{key_env}" if key_env else "")
+                f"cmd:{key_cmd}"
+                if key_cmd
+                else (
+                    inline_api_key
+                    if inline_api_key
+                    else (f"env:{key_env}" if key_env else "")
+                )
             )
             api_url_norm = str(api_url).strip().rstrip("/").lower()
             # Per-provider extra_headers participate in the group identity
@@ -3379,6 +3422,11 @@ def list_authenticated_providers(
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
+            cache_credential_id = None
+            if discover:
+                api_key, cache_credential_id = _with_key_cmd_discovery_credential(
+                    api_key, ep_cfg, display_name
+                )
             has_explicit_models = bool(grp.get("has_explicit_models"))
             _ep_url_norm = str(api_url).strip().rstrip("/").lower()
             _ep_slug_norm = str(ep_name).strip().lower()
@@ -3427,6 +3475,7 @@ def list_authenticated_providers(
                         headers=_extra_headers_from_config(ep_cfg) or None,
                         timeout=(1.5 if for_picker else 5.0),
                         api_mode=ep_cfg.get("api_mode"),
+                        cache_credential_id=cache_credential_id,
                     )
                     if isinstance(live_models, _NativePickerModelList):
                         native_catalog_empty = not live_models
@@ -3449,6 +3498,7 @@ def list_authenticated_providers(
                         timeout=(1.5 if for_picker else 5.0),
                         headers=_extra_headers_from_config(ep_cfg) or None,
                         api_mode=ep_cfg.get("api_mode"),
+                        cache_credential_id=cache_credential_id,
                     )
                     if cached_models:
                         models_list = cached_models
@@ -3593,6 +3643,7 @@ def list_authenticated_providers(
                 continue
             inline_api_key = str(entry.get("api_key") or "").strip()
             key_env = str(entry.get("key_env") or "").strip()
+            key_cmd = str(entry.get("key_cmd") or "").strip()
             api_key = inline_api_key or _scoped_key_env(key_env)
             api_mode = str(
                 entry.get("api_mode")
@@ -3600,9 +3651,13 @@ def list_authenticated_providers(
                 or ""
             ).strip().lower() or None
             credential_identity = (
-                inline_api_key
-                if inline_api_key
-                else (f"env:{key_env}" if key_env else "")
+                f"cmd:{key_cmd}"
+                if key_cmd
+                else (
+                    inline_api_key
+                    if inline_api_key
+                    else (f"env:{key_env}" if key_env else "")
+                )
             )
 
             # Read discover_models from the entry (same semantics as
@@ -3641,6 +3696,7 @@ def list_authenticated_providers(
                     "name": display_name,
                     "api_url": api_url,
                     "api_key": api_key,
+                    "key_cmd": key_cmd,
                     "models": [],
                     "has_explicit_models": False,
                     "discover_models": discover,
@@ -3702,6 +3758,11 @@ def list_authenticated_providers(
             api_url = grp["api_url"]
             api_key = grp.get("api_key", "")
             slug = grp["slug"]
+            cache_credential_id = None
+            if grp.get("discover_models", True):
+                api_key, cache_credential_id = _with_key_cmd_discovery_credential(
+                    api_key, grp, grp["name"]
+                )
             # If the slug is already claimed by a built-in / overlay /
             # user-provider row (sections 1-3), skip this custom group
             # to avoid shadowing a real provider.
@@ -3816,6 +3877,7 @@ def list_authenticated_providers(
                         headers=grp.get("extra_headers") or None,
                         timeout=(1.5 if for_picker else 5.0),
                         api_mode=grp.get("api_mode"),
+                        cache_credential_id=cache_credential_id,
                     )
                     if live_models is not None and (
                         live_models
@@ -3845,6 +3907,7 @@ def list_authenticated_providers(
                         timeout=(1.5 if for_picker else 5.0),
                         headers=grp.get("extra_headers") or None,
                         api_mode=grp.get("api_mode"),
+                        cache_credential_id=cache_credential_id,
                     )
                     if cached_models:
                         grp["models"] = cached_models

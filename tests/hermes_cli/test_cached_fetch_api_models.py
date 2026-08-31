@@ -16,7 +16,7 @@ higher-level picker-shape tests.
 from __future__ import annotations
 
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -37,6 +37,28 @@ class TestCachedFetchApiModels:
         assert out == ["m1", "m2"]
         live.assert_not_called()
         save.assert_not_called()
+
+    def test_fresh_entry_does_not_materialize_callable_credential(self):
+        import hermes_cli.models as mod
+
+        token_provider = MagicMock(return_value="fresh-token")
+        cache = {
+            "custom:https://gw.example.com/v1": self._entry(
+                ["m1"], age_seconds=10, fp="fp"
+            )
+        }
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_custom_endpoint_fingerprint", return_value="fp"), \
+             patch.object(mod, "fetch_api_models") as live:
+            out = mod.cached_fetch_api_models(
+                token_provider,
+                "https://gw.example.com/v1",
+                cache_credential_id="key_cmd:mint-token",
+            )
+
+        assert out == ["m1"]
+        token_provider.assert_not_called()
+        live.assert_not_called()
 
     def test_cache_key_normalizes_trailing_slash_and_case(self):
         """A saved entry for the lowercased/rstripped URL must be hit even
@@ -231,6 +253,17 @@ class TestCacheOnly:
         fp_a_again = mod._custom_endpoint_fingerprint("sk-key", None, {"X-Tenant": "a"})
         assert fp_a != fp_b
         assert fp_a == fp_a_again
+
+    def test_stable_credential_identity_ignores_rotating_token_value(self):
+        import hermes_cli.models as mod
+
+        fp_a = mod._custom_endpoint_fingerprint(
+            "token-a", None, {}, credential_id="key_cmd:mint-token"
+        )
+        fp_b = mod._custom_endpoint_fingerprint(
+            "token-b", None, {}, credential_id="key_cmd:mint-token"
+        )
+        assert fp_a == fp_b
 
 
 class TestCachedFetchApiModelsDiskRoundTrip:

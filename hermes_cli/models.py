@@ -20,7 +20,7 @@ import urllib.error
 import time
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, TYPE_CHECKING
+from typing import Any, Callable, NamedTuple, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import TypeGuard
@@ -3992,21 +3992,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             api_key=cfg_api_key or None,
         )
         if live:
-            if cfg_base_url:
-                return live
-            # The live /v1/models dump lags newly-routed curated aliases
-            # (e.g. claude-fable-5, which is reachable on Anthropic before it
-            # is enumerated by the models endpoint). Surface curated entries
-            # first, then append any live-only models, so a fresh curated
-            # model never disappears just because the API hasn't listed it yet.
-            curated = list(_PROVIDER_MODELS.get("anthropic", []))
-            merged = list(curated)
-            merged_lower = {m.lower() for m in curated}
-            for m in live:
-                if m.lower() not in merged_lower:
-                    merged.append(m)
-                    merged_lower.add(m.lower())
-            return merged
+            # A successful authenticated catalog is authoritative. Merging the
+            # fallback list here can advertise models this account cannot use.
+            return live
         return list(_PROVIDER_MODELS.get("anthropic", []))
     if normalized == "ai-gateway":
         live = _fetch_ai_gateway_models()
@@ -4593,43 +4581,47 @@ def _fetch_anthropic_models(
         return None
 
     resolved_base_url = base_url
-    token = (api_key or "").strip() or resolve_anthropic_token()
+    explicit_token = (api_key or "").strip()
+    token = explicit_token or resolve_anthropic_token()
+    using_pool_fallback = False
     if not token:
         # A pool credential and its endpoint are one security boundary. Never
         # pair the selected pool key with a caller-provided model endpoint.
         token, resolved_base_url = _resolve_anthropic_pool_catalog_credentials()
+        using_pool_fallback = True
     if not token:
         return None
 
-    headers: dict[str, str] = {"anthropic-version": "2023-06-01"}
-    is_oauth = _is_oauth_token(token)
-    if is_oauth:
-        headers["Authorization"] = f"Bearer {token}"
-        from agent.anthropic_adapter import _COMMON_BETAS, _OAUTH_ONLY_BETAS, _CONTEXT_1M_BETA
-        headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
-    else:
-        headers["x-api-key"] = token
+    def _fetch_with_credential(credential: str, endpoint: Optional[str]):
+        headers: dict[str, str] = {"anthropic-version": "2023-06-01"}
+        is_oauth = _is_oauth_token(credential)
+        if is_oauth:
+            headers["Authorization"] = f"Bearer {credential}"
+            from agent.anthropic_adapter import (
+                _COMMON_BETAS,
+                _CONTEXT_1M_BETA,
+                _OAUTH_ONLY_BETAS,
+            )
+            headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
+        else:
+            headers["x-api-key"] = credential
 
-    def _do_request(h: dict[str, str]):
-        req = urllib.request.Request(
-            _anthropic_models_url(resolved_base_url),
-            headers=h,
-        )
-        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+        def _do_request(h: dict[str, str]):
+            req = urllib.request.Request(
+                _anthropic_models_url(endpoint),
+                headers=h,
+            )
+            with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
 
-    try:
         try:
-            data = _do_request(headers)
+            return _do_request(headers)
         except urllib.error.HTTPError as http_err:
             # Reactive recovery for OAuth subscriptions that reject the 1M
             # context beta with 400 "long context beta is not yet available
             # for this subscription". Retry once without the beta; re-raise
-            # anything else so the outer except logs it.
-            if (
-                is_oauth
-                and http_err.code == 400
-            ):
+            # anything else so the caller can try another automatic credential.
+            if is_oauth and http_err.code == 400:
                 try:
                     body_text = http_err.read().decode(errors="ignore").lower()
                 except Exception:
@@ -4639,11 +4631,23 @@ def _fetch_anthropic_models(
                         [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
                         + list(_OAUTH_ONLY_BETAS)
                     )
-                    data = _do_request(headers)
-                else:
-                    raise
-            else:
+                    return _do_request(headers)
+            raise
+
+    try:
+        try:
+            data = _fetch_with_credential(token, resolved_base_url)
+        except Exception:
+            # Automatic OAuth discovery can select a stale Claude Code token.
+            # If it fails, try the read-only API-key pool credential with its
+            # own endpoint. Never override an explicitly supplied credential.
+            if explicit_token or using_pool_fallback:
                 raise
+            pool_token, pool_base_url = _resolve_anthropic_pool_catalog_credentials()
+            if not pool_token:
+                raise
+            data = _fetch_with_credential(pool_token, pool_base_url)
+
         models = [m["id"] for m in data.get("data", []) if m.get("id")]
         # Sort: latest/largest first (opus > sonnet > haiku, higher version first)
         return sorted(models, key=lambda m: (
@@ -5737,6 +5741,103 @@ def probe_api_models(
         headers.update(normalize_extra_headers(request_headers))
 
     _ssl_context = _custom_provider_ssl_context(normalized)
+    parsed_base = urllib.parse.urlparse(normalized)
+    hostname = (parsed_base.hostname or "").lower()
+    is_databricks_workspace = (
+        hostname.endswith(".databricks.com")
+        or hostname.endswith(".azuredatabricks.net")
+    )
+    gateway_path = parsed_base.path.rstrip("/").lower()
+    databricks_api_type = None
+    if is_databricks_workspace and "/ai-gateway/" in gateway_path:
+        if api_mode == "codex_responses" and gateway_path.endswith("/openai/v1"):
+            databricks_api_type = "openai/v1/responses"
+        elif api_mode == "chat_completions" and gateway_path.endswith("/mlflow/v1"):
+            databricks_api_type = "mlflow/v1/chat/completions"
+        elif api_mode == "anthropic_messages" and gateway_path.endswith("/anthropic"):
+            databricks_api_type = "anthropic/v1/messages"
+
+    if databricks_api_type:
+        catalog_url = (
+            f"{parsed_base.scheme}://{parsed_base.netloc}/api/2.0/serving-endpoints"
+        )
+        catalog_headers = dict(headers)
+        if api_key:
+            # The Anthropic inference route uses x-api-key, but Databricks'
+            # workspace catalog always authenticates with a bearer token.
+            catalog_headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(catalog_url, headers=catalog_headers)
+        try:
+            open_kwargs: dict[str, Any] = {"timeout": timeout}
+            if _ssl_context is not None:
+                open_kwargs["ssl_context"] = _ssl_context
+            with _urlopen_model_catalog_request(req, **open_kwargs) as resp:
+                payload = json.loads(resp.read().decode())
+            endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+            if not isinstance(endpoints, list):
+                raise ValueError("Databricks catalog response has no endpoints list")
+            model_ids: list[str] = []
+            for endpoint in endpoints:
+                if not isinstance(endpoint, dict):
+                    continue
+                state = endpoint.get("state")
+                capabilities = endpoint.get("capabilities")
+                config = endpoint.get("config")
+                if not isinstance(state, dict):
+                    continue
+                if not isinstance(capabilities, dict):
+                    continue
+                if not isinstance(config, dict):
+                    continue
+                if state.get("ready") != "READY":
+                    continue
+                if capabilities.get("function_calling") is not True:
+                    continue
+                entities = config.get("served_entities")
+                if not isinstance(entities, list):
+                    continue
+                supported_api_types: set[str] = set()
+                for entity in entities:
+                    if not isinstance(entity, dict):
+                        continue
+                    foundation = entity.get("foundation_model")
+                    if not isinstance(foundation, dict):
+                        continue
+                    if foundation.get("ai_gateway_v2_supported") is not True:
+                        continue
+                    api_types = foundation.get("api_types")
+                    if isinstance(api_types, list):
+                        supported_api_types.update(
+                            api_type for api_type in api_types
+                            if isinstance(api_type, str)
+                        )
+                preferred_api = next(
+                    (
+                        candidate
+                        for candidate in (
+                            "anthropic/v1/messages",
+                            "openai/v1/responses",
+                            "mlflow/v1/chat/completions",
+                        )
+                        if candidate in supported_api_types
+                    ),
+                    None,
+                )
+                model_id = str(endpoint.get("name") or "").strip()
+                if preferred_api == databricks_api_type and model_id:
+                    model_ids.append(model_id)
+            return {
+                "models": sorted(dict.fromkeys(model_ids)),
+                "probed_url": catalog_url,
+                "resolved_base_url": normalized,
+                "suggested_base_url": None,
+                "used_fallback": False,
+            }
+        except Exception:
+            # Older Databricks gateways may not expose the workspace catalog;
+            # retain the standard /models probes as a compatibility fallback.
+            pass
+
     for candidate_base, is_fallback in candidates:
         url = candidate_base.rstrip("/") + "/models"
         tried.append(url)
@@ -6042,9 +6143,11 @@ def fetch_api_models(
 
 
 def _custom_endpoint_fingerprint(
-    api_key: Optional[str],
+    api_key: Optional[str | Callable[[], str]],
     api_mode: Optional[str],
     headers: Optional[dict[str, str]],
+    *,
+    credential_id: Optional[str] = None,
 ) -> str:
     """Fingerprint the credentials/wire-shape used to probe a custom endpoint.
 
@@ -6056,8 +6159,11 @@ def _custom_endpoint_fingerprint(
     """
     import hashlib
 
+    credential_value = credential_id or (
+        api_key if isinstance(api_key, str) else ""
+    )
     blob = "|".join((
-        api_key or "",
+        credential_value,
         api_mode or "",
         json.dumps(headers or {}, sort_keys=True),
     )).encode("utf-8", errors="replace")
@@ -6090,12 +6196,13 @@ def _cache_entry_valid(
 
 
 def cached_fetch_api_models(
-    api_key: Optional[str],
+    api_key: Optional[str | Callable[[], str]],
     base_url: Optional[str],
     *,
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
     headers: Optional[dict[str, str]] = None,
+    cache_credential_id: Optional[str] = None,
     force_refresh: bool = False,
     cache_only: bool = False,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
@@ -6119,6 +6226,9 @@ def cached_fetch_api_models(
     block on a stopped local endpoint) use this so a warm catalog still
     reaches the picker instead of collapsing to the config-declared subset.
     """
+    def materialize_api_key() -> Optional[str]:
+        return api_key() if callable(api_key) else api_key
+
     normalized_url = str(base_url or "").strip().rstrip("/").lower()
     if not normalized_url:
         if cache_only:
@@ -6126,11 +6236,14 @@ def cached_fetch_api_models(
         # No base_url means nothing to key the cache on — fall through to a
         # live call so callers keep getting fetch_api_models' own behavior.
         return fetch_api_models(
-            api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+            materialize_api_key(), base_url,
+            timeout=timeout, api_mode=api_mode, headers=headers,
         )
 
     cache_key = f"custom:{normalized_url}"
-    fp = _custom_endpoint_fingerprint(api_key, api_mode, headers)
+    fp = _custom_endpoint_fingerprint(
+        api_key, api_mode, headers, credential_id=cache_credential_id
+    )
     cache = _load_provider_models_cache()
     entry = cache.get(cache_key)
     now = time.time()
@@ -6157,7 +6270,7 @@ def cached_fetch_api_models(
             # hour into the session); refresh off-thread for the next open.
             def _refresh_custom():
                 live = fetch_api_models(
-                    api_key, base_url,
+                    materialize_api_key(), base_url,
                     timeout=timeout, api_mode=api_mode, headers=headers,
                 )
                 if not live:
@@ -6168,7 +6281,8 @@ def cached_fetch_api_models(
             return list(entry["models"])
 
     live = fetch_api_models(
-        api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+        materialize_api_key(), base_url,
+        timeout=timeout, api_mode=api_mode, headers=headers,
     )
     if live:
         cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}

@@ -88,6 +88,87 @@ def test_picker_generic_discovery_preserves_api_mode(monkeypatch):
     assert calls[0][1]["api_mode"] == "anthropic_messages"
 
 
+def test_providers_key_cmd_supplies_live_discovery_credential(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    token_provider = lambda: "fresh-token"
+
+    def build_token(command, label):
+        assert command == "databricks auth token -p PROD"
+        assert label == "Databricks GPT"
+        return token_provider
+
+    monkeypatch.setattr(
+        "agent.command_token_source.build_command_token_provider", build_token
+    )
+
+    calls = []
+
+    def fetch(api_key, api_url, *args, **kwargs):
+        calls.append((api_key, api_url, kwargs))
+        return ["databricks-gpt-5", "databricks-grok-4-6"]
+
+    monkeypatch.setattr("hermes_cli.model_switch._fetch_picker_live_models", fetch)
+
+    rows = list_authenticated_providers(
+        current_provider="databricks-gpt",
+        user_providers={
+            "databricks-gpt": {
+                "name": "Databricks GPT",
+                "base_url": "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+                "key_cmd": "databricks auth token -p PROD",
+                "api_mode": "codex_responses",
+                "model": "databricks-gpt-5",
+                "discover_models": True,
+            }
+        },
+        custom_providers=[],
+        probe_custom_providers=True,
+    )
+
+    row = next(row for row in rows if row["slug"] == "databricks-gpt")
+    assert row["models"] == ["databricks-gpt-5", "databricks-grok-4-6"]
+    assert calls[0][0] is token_provider
+    assert calls[0][2]["cache_credential_id"] == (
+        "key_cmd:databricks auth token -p PROD"
+    )
+
+
+def test_legacy_custom_provider_key_cmd_supplies_discovery_credential(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    token_provider = lambda: "fresh-token"
+    monkeypatch.setattr(
+        "agent.command_token_source.build_command_token_provider",
+        lambda command, label: token_provider,
+    )
+    calls = []
+
+    def fetch(api_key, api_url, *args, **kwargs):
+        calls.append((api_key, kwargs))
+        return ["live-a", "live-b"]
+
+    monkeypatch.setattr("hermes_cli.model_switch._fetch_picker_live_models", fetch)
+
+    rows = list_authenticated_providers(
+        current_provider="custom:command-backed",
+        user_providers={},
+        custom_providers=[{
+            "name": "Command Backed",
+            "base_url": "https://gateway.example/v1",
+            "key_cmd": "mint-token",
+            "model": "saved-model",
+            "discover_models": True,
+        }],
+        probe_custom_providers=True,
+    )
+
+    row = next(row for row in rows if row["slug"] == "custom:command-backed")
+    assert row["models"] == ["live-a", "live-b"]
+    assert calls[0][0] is token_provider
+    assert calls[0][1]["cache_credential_id"] == "key_cmd:mint-token"
+
+
 def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})

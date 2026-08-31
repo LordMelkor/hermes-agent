@@ -1555,6 +1555,10 @@ def _normalize_custom_provider_entry(
         if entry.get("api_key_env") and not entry.get("key_env"):
             normalized["api_key_env"] = key_env.strip()
 
+    key_cmd = entry.get("key_cmd")
+    if isinstance(key_cmd, str) and key_cmd.strip():
+        normalized["key_cmd"] = key_cmd.strip()
+
     api_mode = entry.get("api_mode") or entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():
         normalized["api_mode"] = _canonical_api_mode(api_mode)
@@ -1664,6 +1668,7 @@ def _custom_provider_entry_to_provider_config(
         "name",
         "api_key",
         "key_env",
+        "key_cmd",
         "models",
         "models_discovered",
         "context_length",
@@ -2109,7 +2114,7 @@ _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
-    "name", "base_url", "api_key", "api_mode", "model", "models",
+    "name", "base_url", "api_key", "key_cmd", "api_mode", "model", "models",
     "context_length", "rate_limit_delay", "extra_body",
     "ssl_ca_cert", "ssl_verify",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py

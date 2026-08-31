@@ -9,10 +9,23 @@ caller's entry, corrupting the shared cache for every subsequent reader.
 import copy
 
 from hermes_cli.config import (
+    _custom_provider_entry_to_provider_config,
     _normalize_custom_provider_entry,
     get_compatible_custom_providers,
     providers_dict_to_custom_providers,
 )
+
+
+def test_legacy_provider_migration_preserves_key_cmd():
+    migrated = _custom_provider_entry_to_provider_config(
+        {
+            "name": "dbx",
+            "base_url": "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+            "key_cmd": "databricks auth token -p PROD",
+        }
+    )
+    assert migrated is not None
+    assert migrated["key_cmd"] == "databricks auth token -p PROD"
 
 
 def test_normalizer_does_not_mutate_entry_api_key_env():

@@ -8,7 +8,7 @@ offer them — the TUI ``/model`` picker already renders these entries
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -30,6 +30,72 @@ def _cfg(providers=None, custom_providers=None):
 
 
 class TestNamedCustomProviderCatalogs:
+
+    def test_reuses_key_cmd_source_and_stable_cache_identity(self):
+        cfg = _cfg(
+            providers={
+                "databricks-gpt-repeat": {
+                    "name": "Databricks GPT Repeat",
+                    "base_url": "https://repeat.cloud.databricks.com/ai-gateway/openai/v1",
+                    "key_cmd": "databricks auth token -p REPEAT",
+                    "api_mode": "codex_responses",
+                    "discover_models": True,
+                    "model": "databricks-gpt-5",
+                }
+            }
+        )
+        with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+            "agent.command_token_source.build_command_token_provider",
+            return_value=lambda: "rotating-token",
+        ) as build_token, patch(
+            "hermes_cli.model_switch._fetch_picker_live_models",
+            return_value=["databricks-gpt-5"],
+        ) as fetch:
+            _named_custom_provider_catalogs()
+            _named_custom_provider_catalogs()
+
+        build_token.assert_called_once_with(
+            "databricks auth token -p REPEAT", "Databricks GPT Repeat"
+        )
+        assert len(fetch.call_args_list) == 2
+        assert all(
+            call.kwargs["cache_credential_id"]
+            == "key_cmd:databricks auth token -p REPEAT"
+            for call in fetch.call_args_list
+        )
+
+    def test_key_cmd_supplies_live_discovery_credential(self):
+        cfg = _cfg(
+            providers={
+                "databricks-gpt": {
+                    "name": "Databricks GPT",
+                    "base_url": "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+                    "key_cmd": "databricks auth token -p PROD",
+                    "api_mode": "codex_responses",
+                    "discover_models": True,
+                    "model": "databricks-gpt-5",
+                }
+            }
+        )
+        token_provider = MagicMock(return_value="fresh-token")
+        with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+            "agent.command_token_source.build_command_token_provider",
+            return_value=token_provider,
+        ) as build_token, patch(
+            "hermes_cli.model_switch._fetch_picker_live_models",
+            return_value=["databricks-gpt-5", "databricks-grok-4-6"],
+        ) as fetch:
+            catalogs = _named_custom_provider_catalogs()
+
+        build_token.assert_called_once_with(
+            "databricks auth token -p PROD", "Databricks GPT"
+        )
+        assert fetch.call_args.args[0] is token_provider
+        token_provider.assert_not_called()
+        assert [model for model, _ in catalogs[0][2]] == [
+            "databricks-gpt-5",
+            "databricks-grok-4-6",
+        ]
 
     def test_live_discovery_extends_declared_models(self, monkeypatch):
         monkeypatch.setenv("SOME_KEY", "k")

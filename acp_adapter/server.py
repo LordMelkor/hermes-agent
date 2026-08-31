@@ -86,6 +86,8 @@ from tools.approval import (
 
 logger = logging.getLogger(__name__)
 
+_MODEL_DISCOVERY_TOKEN_PROVIDERS: dict[tuple[str, str], Any] = {}
+
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
     """Return ``(slug, label, [(model_id, description), ...])`` for named endpoints.
@@ -163,6 +165,28 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
             ).strip()
             api_key = os.environ.get(key_env, "").strip() if key_env else ""
 
+        discover = entry.get("discover_models", True)
+        if isinstance(discover, str):
+            discover = discover.lower() not in {"false", "no", "0"}
+        key_cmd = str(entry.get("key_cmd", "") or "").strip()
+        if discover and key_cmd:
+            try:
+                from agent.command_token_source import build_command_token_provider
+
+                token_key = (name, key_cmd)
+                token_provider = _MODEL_DISCOVERY_TOKEN_PROVIDERS.get(token_key)
+                if token_provider is None:
+                    token_provider = build_command_token_provider(key_cmd, name)
+                    if token_provider is not None:
+                        _MODEL_DISCOVERY_TOKEN_PROVIDERS[token_key] = token_provider
+                if token_provider is not None:
+                    api_key = token_provider
+            except Exception:
+                logger.debug(
+                    "Could not mint model-discovery token for %s", name,
+                    exc_info=True,
+                )
+
         declared: list[str] = []
         default_model = str(entry.get("model", "") or "").strip()
         if default_model:
@@ -190,13 +214,13 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
             continue
 
         model_ids = list(declared)
-        discover = entry.get("discover_models", True)
-        if isinstance(discover, str):
-            discover = discover.lower() not in {"false", "no", "0"}
         native_catalog_provider = native_catalog_provider if is_native_ollama else "custom"
         live = None
         if discover and (api_key or is_native_ollama):
             try:
+                fetch_kwargs = {}
+                if key_cmd:
+                    fetch_kwargs["cache_credential_id"] = f"key_cmd:{key_cmd}"
                 live = _fetch_picker_live_models(
                     api_key,
                     base_url,
@@ -205,6 +229,7 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
                     headers=native_headers,
                     timeout=1.5,
                     api_mode=entry.get("api_mode"),
+                    **fetch_kwargs,
                 )
             except Exception:
                 live = None

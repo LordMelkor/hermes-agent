@@ -12,6 +12,7 @@ from hermes_cli.models import (
     check_nous_free_tier, _FREE_TIER_CACHE_TTL,
     union_with_portal_free_recommendations,
     union_with_portal_paid_recommendations,
+    probe_api_models,
 )
 import hermes_cli.models as _models_mod
 
@@ -20,6 +21,262 @@ LIVE_OPENROUTER_MODELS = [
     ("qwen/qwen3.7-max", ""),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
 ]
+
+
+class _CatalogResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode()
+
+
+class TestDatabricksGatewayModelDiscovery:
+    def test_malformed_endpoint_does_not_discard_valid_catalog_rows(self):
+        payload = {"endpoints": [
+            {
+                "name": "broken",
+                "state": None,
+                "capabilities": None,
+                "config": None,
+            },
+            {
+                "name": "good",
+                "state": {"ready": "READY"},
+                "capabilities": {"function_calling": True},
+                "config": {"served_entities": [{"foundation_model": {
+                    "ai_gateway_v2_supported": True,
+                    "api_types": ["openai/v1/responses"],
+                }}]},
+            },
+        ]}
+        responses = [
+            _CatalogResponse(payload),
+            _CatalogResponse({"data": [{"id": "fallback-unfiltered"}]}),
+        ]
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            side_effect=responses,
+        ) as opener:
+            result = probe_api_models(
+                "secret",
+                "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+                api_mode="codex_responses",
+            )
+
+        assert result["models"] == ["good"]
+        assert opener.call_count == 1
+
+    def test_multi_entity_endpoint_has_one_preferred_protocol(self):
+        payload = {"endpoints": [{
+            "name": "mixed-endpoint",
+            "capabilities": {"function_calling": True},
+            "state": {"ready": "READY"},
+            "config": {"served_entities": [
+                {"foundation_model": {
+                    "ai_gateway_v2_supported": True,
+                    "api_types": ["anthropic/v1/messages"],
+                }},
+                {"foundation_model": {
+                    "ai_gateway_v2_supported": True,
+                    "api_types": ["openai/v1/responses"],
+                }},
+            ]},
+        }]}
+
+        def discover(path, mode):
+            with patch(
+                "hermes_cli.models._urlopen_model_catalog_request",
+                return_value=_CatalogResponse(payload),
+            ):
+                return probe_api_models(
+                    "secret",
+                    f"https://workspace.cloud.databricks.com/ai-gateway/{path}",
+                    api_mode=mode,
+                )["models"]
+
+        assert discover("anthropic", "anthropic_messages") == ["mixed-endpoint"]
+        assert discover("openai/v1", "codex_responses") == []
+
+    def test_mlflow_gateway_excludes_models_with_richer_native_protocols(self):
+        def endpoint(name, api_types):
+            return {
+                "name": name,
+                "capabilities": {"function_calling": True},
+                "state": {"ready": "READY"},
+                "config": {"served_entities": [{"foundation_model": {
+                    "ai_gateway_v2_supported": True,
+                    "api_types": api_types,
+                }}]},
+            }
+
+        payload = {"endpoints": [
+            endpoint("databricks-kimi-k3", ["mlflow/v1/chat/completions"]),
+            endpoint("databricks-gpt-5-6-sol", [
+                "mlflow/v1/chat/completions", "openai/v1/responses",
+            ]),
+            endpoint("databricks-claude-opus-5", [
+                "mlflow/v1/chat/completions", "anthropic/v1/messages",
+            ]),
+        ]}
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=_CatalogResponse(payload),
+        ):
+            result = probe_api_models(
+                "secret",
+                "https://workspace.cloud.databricks.com/ai-gateway/mlflow/v1",
+                api_mode="chat_completions",
+            )
+
+        assert result["models"] == ["databricks-kimi-k3"]
+
+    def test_non_databricks_ai_gateway_uses_standard_models_route(self):
+        def open_catalog(request, **kwargs):
+            if request.full_url.endswith("/models"):
+                return _CatalogResponse({"data": [{"id": "real-model"}]})
+            return _CatalogResponse({})
+
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            side_effect=open_catalog,
+        ) as opener:
+            result = probe_api_models(
+                "secret",
+                "https://gateway.example.com/ai-gateway/openai/v1",
+                api_mode="codex_responses",
+            )
+
+        assert result["models"] == ["real-model"]
+        assert opener.call_args.args[0].full_url.endswith("/models")
+
+    def test_malformed_databricks_catalog_falls_back_to_models_route(self):
+        def open_catalog(request, **kwargs):
+            if request.full_url.endswith("/serving-endpoints"):
+                return _CatalogResponse({})
+            return _CatalogResponse({"data": [{"id": "fallback-model"}]})
+
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            side_effect=open_catalog,
+        ):
+            result = probe_api_models(
+                "secret",
+                "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+                api_mode="codex_responses",
+            )
+
+        assert result["models"] == ["fallback-model"]
+
+    def test_databricks_catalog_uses_custom_provider_ssl_context(self):
+        payload = {"endpoints": []}
+        ssl_context = object()
+        with patch(
+            "hermes_cli.models._custom_provider_ssl_context",
+            return_value=ssl_context,
+        ), patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=_CatalogResponse(payload),
+        ) as opener:
+            probe_api_models(
+                "secret",
+                "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+                api_mode="codex_responses",
+            )
+
+        assert opener.call_args.kwargs["ssl_context"] is ssl_context
+
+    def test_openai_gateway_uses_workspace_catalog_and_filters_by_api(self):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-grok-4-6",
+                    "capabilities": {"function_calling": True},
+                    "state": {"ready": "READY"},
+                    "config": {"served_entities": [{"foundation_model": {
+                        "ai_gateway_v2_supported": True,
+                        "api_types": ["mlflow/v1/chat/completions", "openai/v1/responses"],
+                    }}]},
+                },
+                {
+                    "name": "databricks-claude-opus-5",
+                    "capabilities": {"function_calling": True},
+                    "state": {"ready": "READY"},
+                    "config": {"served_entities": [{"foundation_model": {
+                        "ai_gateway_v2_supported": True,
+                        "api_types": ["mlflow/v1/chat/completions", "anthropic/v1/messages"],
+                    }}]},
+                },
+                {
+                    "name": "databricks-bge-large-en",
+                    "capabilities": {"function_calling": False},
+                    "state": {"ready": "READY"},
+                    "config": {"served_entities": [{"foundation_model": {
+                        "ai_gateway_v2_supported": True,
+                        "api_types": ["openai/v1/responses"],
+                    }}]},
+                },
+            ]
+        }
+
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=_CatalogResponse(payload),
+        ) as opener:
+            result = probe_api_models(
+                "fresh-token",
+                "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
+                api_mode="codex_responses",
+            )
+
+        assert result["models"] == ["databricks-grok-4-6"]
+        request = opener.call_args.args[0]
+        assert request.full_url == (
+            "https://workspace.cloud.databricks.com/api/2.0/serving-endpoints"
+        )
+        assert request.get_header("Authorization") == "Bearer fresh-token"
+
+    def test_anthropic_gateway_filters_for_native_messages(self):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-claude-opus-5",
+                    "capabilities": {"function_calling": True},
+                    "state": {"ready": "READY"},
+                    "config": {"served_entities": [{"foundation_model": {
+                        "ai_gateway_v2_supported": True,
+                        "api_types": ["anthropic/v1/messages"],
+                    }}]},
+                },
+                {
+                    "name": "databricks-grok-4-6",
+                    "capabilities": {"function_calling": True},
+                    "state": {"ready": "READY"},
+                    "config": {"served_entities": [{"foundation_model": {
+                        "ai_gateway_v2_supported": True,
+                        "api_types": ["openai/v1/responses"],
+                    }}]},
+                },
+            ]
+        }
+
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=_CatalogResponse(payload),
+        ):
+            result = probe_api_models(
+                "fresh-token",
+                "https://workspace.cloud.databricks.com/ai-gateway/anthropic",
+                api_mode="anthropic_messages",
+            )
+
+        assert result["models"] == ["databricks-claude-opus-5"]
 
 
 class TestModelIds:
