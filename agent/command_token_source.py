@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 _TOKEN_REFRESH_LEEWAY_SECONDS = 60.0
 # Helpers answer from a local cache in milliseconds; this long means hung.
 _MINT_TIMEOUT_SECONDS = 15
-# No advertised expiry: nothing in the request path re-mints on 401 (the SDK retries 429/5xx only), so
-# a process-lifetime cache would 401 forever once the token died. Re-mint on a bounded window instead.
+# No advertised expiry: a process-lifetime cache would 401 forever once the token died (a pool-less
+# provider gets one forced re-mint per token, see remint_after_auth_failure). Re-mint on a bounded window.
 _NO_TTL_REFRESH_SECONDS = 900.0
 
 
@@ -121,6 +121,8 @@ class CommandTokenSource:
         self._lock = threading.Lock()
         self._token = ""
         self._expires_at: float = 0.0
+        self._remint_pending = False  # the next mint answers a rejection
+        self._reminted = False  # the cached token answered a rejection
 
     @property
     def cache_identity(self) -> str:
@@ -133,6 +135,7 @@ class CommandTokenSource:
                 return self._token
             token, ttl = _mint(self._command, self._label)
             self._token = token
+            self._reminted, self._remint_pending = self._remint_pending, False
             self._expires_at = time.monotonic() + (
                 max(ttl - _TOKEN_REFRESH_LEEWAY_SECONDS, 5.0) if ttl else _NO_TTL_REFRESH_SECONDS
             )
@@ -141,6 +144,36 @@ class CommandTokenSource:
                 self._label, f"{int(ttl)}s" if ttl else "unknown",
             )
             return token
+
+    def invalidate(self) -> bool:
+        """Drop a live cached token the provider rejected, so the next call re-runs the helper.
+
+        The advertised TTL can outlive the credential (a cached helper reprints a stale lifetime; a
+        broker can revoke early), so a rejection is the authoritative staleness signal. Refused for a
+        token that itself answered a rejection: a revoked credential mints the same dead token, and
+        retrying it would spin. The next scheduled mint re-arms recovery. Also refused when nothing
+        live is cached (the next call mints anyway, and a failed mint will fail again)."""
+        with self._lock:
+            if self._reminted or not self._token or time.monotonic() >= self._expires_at:
+                return False
+            self._token, self._expires_at, self._remint_pending = "", 0.0, True
+            return True
+
+
+def remint_after_auth_failure(api_key: object, status_code: Optional[int], classified_reason: object) -> bool:
+    """Auth recovery for a provider without a credential pool: True when a rejected ``key_cmd``
+    token was dropped so the retry re-mints (#91119). A bare status counts only as 401; 403 is
+    often quota or permission, which a new token cannot fix."""
+    from agent.error_classifier import FailoverReason
+
+    if classified_reason is None:
+        is_auth = status_code == 401
+    else:
+        is_auth = classified_reason in (FailoverReason.auth, FailoverReason.auth_permanent)
+    if not (is_auth and isinstance(api_key, CommandTokenSource) and api_key.invalidate()):
+        return False
+    logger.info("Auth failure on key_cmd provider %s: dropped the cached token, re-minting for one retry", api_key._label)
+    return True
 
 
 def build_command_token_provider(key_cmd: str, provider_label: str = "custom") -> Optional[CommandTokenSource]:
