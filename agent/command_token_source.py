@@ -5,7 +5,7 @@ copied into ``.env`` goes stale within the hour. ``key_cmd`` names a command tha
 (the ``apiKeyHelper`` / ``gcloud auth print-access-token`` idiom). Both wire clients accept a
 callable API key and invoke it per request; the token is cached until shortly before expiry.
 Output contract: ONLY the token on stdout, bare or as JSON with an ``access_token`` field
-(``expires_in`` / ISO ``expiry`` honoured). Precedence: explicit ``--api-key`` wins (one-off
+(the shortest of ``expires_in`` / ISO ``expiry`` honoured). Precedence: explicit ``--api-key`` wins (one-off
 recovery escape hatch); otherwise ``key_cmd`` beats a static ``api_key`` / ``key_env``.
 """
 
@@ -87,19 +87,19 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
                 raise CommandTokenError(
                     f"key_cmd for provider {label!r} returned JSON without an 'access_token' field"
                 )
-            ttl = payload.get("expires_in")
-            if isinstance(ttl, (int, float)) and ttl > 0:
-                return token, float(ttl)
-            # CLI helpers often print an absolute ISO 8601 deadline instead of OAuth's relative
-            # lifetime; honour it or the token 401s once past. Lazy import: hermes_cli.auth imports agent.*.
+            # CLI helpers often print an absolute ISO 8601 deadline instead of (or beside) OAuth's
+            # relative lifetime. Honour the SHORTEST: a helper answering from its own cache reprints the
+            # original ``expires_in`` while the deadline counts down. Lazy import: hermes_cli.auth imports agent.*.
             from hermes_cli.auth import _parse_iso_timestamp
 
+            relative = payload.get("expires_in")
+            lifetimes = [float(relative)] if isinstance(relative, (int, float)) else []
             for field in ("expiry", "expiresOn"):
                 deadline = _parse_iso_timestamp(payload.get(field))
-                remaining = deadline - time.time() if deadline is not None else 0
-                if remaining > 0:
-                    return token, remaining
-            return token, None
+                if deadline is not None:
+                    lifetimes.append(deadline - time.time())
+            usable = [ttl for ttl in lifetimes if ttl > 0]
+            return token, (min(usable) if usable else None)
 
     # Bare token: stdout carries the token and nothing else. Do NOT keep one line of several — that
     # turns a misconfigured helper (banner, warning) into a corrupt-key 401 far harder to diagnose.
